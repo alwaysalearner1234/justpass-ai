@@ -1,0 +1,31 @@
+# Example Terraform Variable Values for JustPass AI
+
+project_id  = "my-gcp-project-id"
+region      = "us-central1"
+environment = "production"
+
+# Artifact Registry
+artifact_registry_repo_id = "justpass-ai"
+
+# Cloud Run API
+cloud_run_service_name   = "justpass-api"
+cloud_run_port           = 8000
+cloud_run_min_instances  = 0
+cloud_run_max_instances  = 10
+cloud_run_cpu            = "1"
+cloud_run_memory         = "512Mi"
+
+# Backend configuration & environment
+database_url         = "postgresql+asyncpg://user:password@cloud-sql-host:5432/justpass"
+gcs_bucket_name      = "my-gcp-project-id-data"
+agent_url            = ""
+cors_allowed_origins = "https://my-gcp-project-id.web.app,https://my-gcp-project-id.firebaseapp.com"
+
+# Firebase Hosting
+firebase_site_id = "my-gcp-project-id"
+
+# Workload Identity Federation (GitHub Actions)
+github_repository             = "voxix-dev/justpass-ai"
+workload_identity_pool_id     = "github-actions-pool"
+workload_identity_provider_id = "github-provider"
+deployment_service_account_id = "github-actions-deployer"

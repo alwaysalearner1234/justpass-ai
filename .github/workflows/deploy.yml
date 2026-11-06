@@ -1,0 +1,145 @@
+name: Deploy (GCP Cloud Run & Firebase Hosting)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_backend:
+        description: 'Deploy Backend to Cloud Run'
+        type: boolean
+        required: true
+        default: true
+      deploy_frontend:
+        description: 'Deploy Frontend to Firebase Hosting'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # Required for Workload Identity Federation OIDC token exchange
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+  WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  WIF_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || secrets.GCP_SERVICE_ACCOUNT }}
+  ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO || 'justpass-ai' }}
+  CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'justpass-api' }}
+
+jobs:
+  # =========================================================================
+  # Backend API: Build, Push to Artifact Registry, Deploy to Cloud Run
+  # =========================================================================
+  deploy-backend:
+    name: Build & Deploy Backend API
+    if: github.event_name == 'push' || inputs.deploy_backend == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Workload Identity Federation Authentication (Zero JSON keys)
+      - name: Authenticate to Google Cloud via WIF
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+          token_format: 'access_token'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker CLI for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Backend Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api:${{ github.sha }}
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Deploy Backend to Cloud Run
+        id: deploy-cloudrun
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.CLOUD_RUN_SERVICE }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api:${{ github.sha }}
+
+      - name: Show Cloud Run Service URL
+        run: |
+          echo "Cloud Run API deployed successfully at: ${{ steps.deploy-cloudrun.outputs.url }}"
+
+  # =========================================================================
+  # Frontend: Build Vite React SPA, Deploy to Firebase Hosting
+  # =========================================================================
+  deploy-frontend:
+    name: Build & Deploy Frontend (Firebase Hosting)
+    needs: [deploy-backend]
+    if: (always() && (github.event_name == 'push' || inputs.deploy_frontend == true)) && (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install Frontend Dependencies
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Web Application
+        working-directory: apps/web
+        run: pnpm build
+
+      # Authenticate via Workload Identity Federation (ADC for Firebase CLI)
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Align Firebase Hosting rewrite to Cloud Run service
+        run: |
+          node -e '
+            const fs = require("fs");
+            const config = JSON.parse(fs.readFileSync("firebase.json", "utf8"));
+            if (config.hosting && config.hosting.rewrites) {
+              const apiRewrite = config.hosting.rewrites.find(r => r.source === "/api/**");
+              if (apiRewrite && apiRewrite.run) {
+                apiRewrite.run.serviceId = "${{ env.CLOUD_RUN_SERVICE }}";
+                apiRewrite.run.region = "${{ env.GCP_REGION }}";
+              }
+            }
+            fs.writeFileSync("firebase.json", JSON.stringify(config, null, 2));
+          '
+
+      - name: Deploy to Firebase Hosting
+        run: |
+          npx --yes firebase-tools deploy --only hosting --project "${{ env.GCP_PROJECT_ID }}" --non-interactive
